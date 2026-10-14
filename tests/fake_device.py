@@ -32,12 +32,16 @@ class FakePocketMaster:
         self.slots = [default_preset(dm, f"Slot {i + 1}" if i not in (0, 9) else "") for i in range(P.PRESET_COUNT)]
         self.current = 3
         self.edit = copy.deepcopy(self.slots[self.current])
+        self.drop: list[set[int]] = []   # per multi-packet reply: packet indexes to lose (like flaky USB MIDI)
 
     # ---- helpers
     def reply(self, payload, packets=1):
         payload = list(payload)
         size = -(-len(payload) // packets)
+        lost = self.drop.pop(0) if packets > 1 and self.drop else set()
         for i in range(packets):
+            if i in lost:
+                continue
             chunk = payload[i * size:(i + 1) * size]
             self.dev.on_midi(mido.Message("sysex", data=P.build(chunk, total=packets, index=i)))
 

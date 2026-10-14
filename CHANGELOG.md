@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Fix: reading the preset dump or preset names failed with "the device did not send ..." when USB MIDI
+  dropped a packet of the multi-packet reply (seen on a real unit, e.g. during `backup_presets`).
+  Queries are now re-sent up to 2 times, and stale partial replies are discarded so packets of two
+  different replies are never combined.
+
 ## 0.1.0 — first public release
 
 - MCP server for the Sonicake Pocket Master over USB MIDI: models, on/off, parameters, chain order,

@@ -19,6 +19,10 @@ log = logging.getLogger("pocket_master_mcp")
 PORT_HINTS = ["pocket", "sonicake", "sonic master", "qme"]
 SEND_GAP_S = 0.015
 REPLY_TIMEOUT_S = 1.5
+DUMP_TIMEOUT_S = 1.5       # per attempt; the dump (26 packets) arrives in ~0.03 s
+NAMES_TIMEOUT_S = 2.0      # per attempt; the names (106 packets) arrive in ~0.1 s
+QUERY_RETRIES = 2          # USB MIDI occasionally drops packets of a multi-packet reply; queries are re-sent
+PARTIAL_TTL_S = 1.0        # a multi-packet reply arrives within ~0.1 s; older partial sets are stale
 
 BLOCK_ALIASES = {
     "gate": "nr", "noisegate": "nr", "ng": "nr", "noise": "nr",
@@ -50,20 +54,26 @@ def data_dir() -> Path:
 
 
 class Reassembler:
-    """Collects the packets of multi-packet responses (same `total`, indexes 0..total-1)."""
+    """Collects the packets of multi-packet responses (same `total`, indexes 0..total-1).
+    Partial sets older than PARTIAL_TTL_S are dropped, so packets of two replies are never mixed."""
 
     def __init__(self) -> None:
         self.pending: dict[int, dict[int, P.Frame]] = {}
+        self.started: dict[int, float] = {}
 
-    def feed(self, f: P.Frame) -> P.Frame | None:
+    def feed(self, f: P.Frame, now: float | None = None) -> P.Frame | None:
         if f.total <= 1:
             return f
-        if f.index == 0:
+        now = time.time() if now is None else now
+        if f.index == 0 or now - self.started.get(f.total, now) > PARTIAL_TTL_S:
             self.pending[f.total] = {}
+            self.started[f.total] = now
         parts = self.pending.setdefault(f.total, {})
+        self.started.setdefault(f.total, now)
         parts[f.index] = f
         if len(parts) == f.total:
             del self.pending[f.total]
+            self.started.pop(f.total, None)
             payload = b"".join(parts[i].payload for i in range(f.total))
             return P.Frame(1, 0, payload, all(p.crc_ok for p in parts.values()))
         return None
@@ -146,7 +156,7 @@ class PocketMaster:
             f = P.parse_frame(data)
         except ValueError:
             return
-        f = self._asm.feed(f)
+        f = self._asm.feed(f, now)
         if f is None:
             return
         self.rx.append((now, f))
@@ -175,13 +185,21 @@ class PocketMaster:
         return None
 
     def request(self, kind: int, pred: Callable[[P.Frame], bool] | None = None,
-                timeout: float = REPLY_TIMEOUT_S) -> P.Frame | None:
-        """Send a query and return the first matching reply (default: any non-ACK frame)."""
+                timeout: float = REPLY_TIMEOUT_S, retries: int | None = None) -> P.Frame | None:
+        """Send a query and return the first matching reply (default: any non-ACK frame).
+        The query is re-sent up to `retries` times if no complete reply arrives within `timeout`."""
         self.ensure()
         pred = pred or (lambda f: f.payload[:1] != bytes([P.ACK]))
-        t0 = time.time()
-        self.sysex(P.query(kind))
-        return self.wait_frame(t0, pred, timeout)
+        retries = QUERY_RETRIES if retries is None else retries
+        for attempt in range(retries + 1):
+            t0 = time.time()
+            self.sysex(P.query(kind))
+            f = self.wait_frame(t0, pred, timeout)
+            if f is not None:
+                return f
+            if attempt < retries:
+                log.info("no complete reply to query %#04x, retrying (%d/%d)", kind, attempt + 1, retries)
+        return None
 
     def send(self, data: list[int], wait_ack: bool = False, timeout: float = 3.0) -> bool | None:
         self.ensure()
@@ -334,7 +352,7 @@ class PocketMaster:
         return self.current
 
     def read_dump(self) -> bytes:
-        f = self.request(P.Q_CURRENT_DUMP, lambda f: len(f.payload) > 200, timeout=3.0)
+        f = self.request(P.Q_CURRENT_DUMP, lambda f: len(f.payload) > 200, timeout=DUMP_TIMEOUT_S)
         if f is None:
             raise RuntimeError("the device did not send the preset dump")
         return f.payload
@@ -383,7 +401,7 @@ class PocketMaster:
         return st
 
     def read_names(self) -> dict[int, str]:
-        f = self.request(P.Q_PRESET_NAMES, lambda f: len(f.payload) > 100, timeout=5.0)
+        f = self.request(P.Q_PRESET_NAMES, lambda f: len(f.payload) > 100, timeout=NAMES_TIMEOUT_S)
         if f is None:
             raise RuntimeError("the device did not send the preset names")
         names = P.preset_name_records(f.payload)

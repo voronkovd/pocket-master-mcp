@@ -10,6 +10,8 @@ from fake_device import FakePocketMaster
 @pytest.fixture
 def dev(monkeypatch):
     monkeypatch.setattr(D, "SEND_GAP_S", 0)
+    monkeypatch.setattr(D, "DUMP_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(D, "NAMES_TIMEOUT_S", 0.05)
     d = D.PocketMaster()
     d.port = FakePocketMaster(d, d.map)
     d.refresh()
@@ -126,3 +128,35 @@ def test_decode_real_dump():
     assert b["dly"] == {"on": False, "model": "Pure", "params": {"Mix": 20, "Time": 500, "F.Back": 30}}
     assert b["rvb"]["on"] is True and b["rvb"]["model"] == "Hall"
     assert [k for k, v in b.items() if v["on"]] == ["nr", "fx1", "amp", "ir", "fx2", "rvb"]
+
+
+def test_dump_retried_when_packets_are_lost(dev):
+    dev.port.drop = [{0, 1}]                     # seen on a real unit: first two packets of a dump lost
+    st = dev.refresh()
+    assert st["blocks"]["amp"]["model"] == "TWD Deluxe"
+    dumps = [f for f in dev.port.sent if f.payload[:2] == bytes([P.GET, P.Q_CURRENT_DUMP])]
+    assert len(dumps) == 3                       # fixture refresh + lost reply + retry
+
+
+def test_names_retried_when_packets_are_lost(dev):
+    dev.port.drop = [{50}]
+    assert dev.read_names()[1] == "Slot 2"
+
+
+def test_dump_fails_after_retries(dev):
+    dev.port.drop = [{0}] * (D.QUERY_RETRIES + 1)
+    with pytest.raises(RuntimeError, match="preset dump"):
+        dev.read_dump()
+
+
+def test_stale_partial_reply_is_not_mixed_in():
+    asm = D.Reassembler()
+    old = [P.Frame(3, i, bytes([i]), True) for i in range(3)]
+    new = [P.Frame(3, i, bytes([10 + i]), True) for i in range(3)]
+    assert asm.feed(old[0], now=0.0) is None     # old reply loses packet 2
+    assert asm.feed(old[1], now=0.0) is None
+    assert asm.feed(new[1], now=5.0) is None     # new reply loses packet 0
+    assert asm.feed(new[2], now=5.0) is None     # without the TTL this would complete as old0+new1+new2
+    for f in new:
+        out = asm.feed(f, now=6.0)
+    assert out.payload == bytes([10, 11, 12])
