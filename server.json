@@ -12,7 +12,7 @@
     {
       "registryType": "pypi",
       "identifier": "pocket-master-mcp",
-      "version": "0.1.0",
+      "version": "0.1.2",
       "runtimeHint": "uvx",
       "transport": {"type": "stdio"},
       "environmentVariables": [
